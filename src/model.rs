@@ -16,6 +16,43 @@ enum Node {
     },
 }
 
+// One workspace is reused across every equation in a vector-field call.
+struct TreeScratch {
+    values: Vec<f64>,
+    slopes: Vec<[f64; 2]>,
+    adjoints: Vec<f64>,
+    leaf_dot: Vec<f64>,
+    operator_values: Vec<f64>,
+}
+
+impl TreeScratch {
+    fn new(node_capacity: usize, operator_count: usize, derivatives: bool) -> Self {
+        Self {
+            values: vec![0.0; node_capacity],
+            slopes: if derivatives {
+                vec![[0.0; 2]; node_capacity]
+            } else {
+                Vec::new()
+            },
+            adjoints: if derivatives {
+                vec![0.0; node_capacity]
+            } else {
+                Vec::new()
+            },
+            leaf_dot: if derivatives {
+                vec![0.0; node_capacity]
+            } else {
+                Vec::new()
+            },
+            operator_values: if derivatives {
+                vec![0.0; node_capacity * operator_count]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Simplex {
     pub(crate) start: usize,
@@ -227,17 +264,15 @@ impl Forest {
         tree: &[Node],
         x: &[f64],
         inputs: &[usize],
-        mut dx: Option<&mut [f64]>,
-        mut dp: Option<&mut [f64]>,
-        seed: f64,
+        gradient: Option<(&mut [f64], &mut [f64], f64)>,
+        scratch: &mut TreeScratch,
     ) -> f64 {
-        let differentiating = seed != 0.0 && (dx.is_some() || dp.is_some());
-        let mut values = vec![0.0; tree.len()];
-        let mut slopes = if differentiating {
-            vec![[0.0; 2]; tree.len()]
-        } else {
-            Vec::new()
-        };
+        let differentiating = gradient.is_some();
+        scratch.values[..tree.len()].fill(0.0);
+        if differentiating {
+            scratch.slopes[..tree.len()].fill([0.0; 2]);
+            scratch.adjoints[..tree.len()].fill(0.0);
+        }
         for (i, node) in tree.iter().enumerate() {
             match *node {
                 Node::Leaf {
@@ -251,7 +286,10 @@ impl Forest {
                         .enumerate()
                         .map(|(j, &index)| self.parameters[variable + j] * x[index])
                         .sum();
-                    values[i] = self.parameters[choice] * self.parameters[c0]
+                    if differentiating {
+                        scratch.leaf_dot[i] = z;
+                    }
+                    scratch.values[i] = self.parameters[choice] * self.parameters[c0]
                         + self.parameters[choice + 1] * self.parameters[c1] * z;
                 }
                 Node::Branch {
@@ -259,22 +297,24 @@ impl Forest {
                     left,
                     right,
                 } => {
+                    let left_value = scratch.values[left];
+                    let right_value = scratch.values[right];
                     for (j, op) in self.operators.iter().enumerate() {
-                        let (v, da, db) = op.evaluate(values[left], values[right]);
-                        values[i] += self.parameters[choice + j] * v;
+                        let (v, da, db) = op.evaluate(left_value, right_value);
+                        scratch.values[i] += self.parameters[choice + j] * v;
                         if differentiating {
-                            slopes[i][0] += self.parameters[choice + j] * da;
-                            slopes[i][1] += self.parameters[choice + j] * db;
+                            scratch.operator_values[i * self.operators.len() + j] = v;
+                            scratch.slopes[i][0] += self.parameters[choice + j] * da;
+                            scratch.slopes[i][1] += self.parameters[choice + j] * db;
                         }
                     }
                 }
             }
         }
-        if differentiating {
-            let mut adjoint = vec![0.0; tree.len()];
-            adjoint[tree.len() - 1] = seed;
+        if let Some((dx, dp, seed)) = gradient {
+            scratch.adjoints[tree.len() - 1] = seed;
             for (i, node) in tree.iter().enumerate().rev() {
-                let a = adjoint[i];
+                let a = scratch.adjoints[i];
                 match *node {
                     Node::Leaf {
                         choice,
@@ -282,30 +322,20 @@ impl Forest {
                         c1,
                         variable,
                     } => {
-                        let z: f64 = inputs
-                            .iter()
-                            .enumerate()
-                            .map(|(j, &index)| self.parameters[variable + j] * x[index])
-                            .sum();
-                        if let Some(g) = dp.as_deref_mut() {
-                            g[choice] += a * self.parameters[c0];
-                            g[choice + 1] += a * self.parameters[c1] * z;
-                            g[c0] += a * self.parameters[choice];
-                            g[c1] += a * self.parameters[choice + 1] * z;
-                            for (j, &index) in inputs.iter().enumerate() {
-                                g[variable + j] += a
-                                    * self.parameters[choice + 1]
-                                    * self.parameters[c1]
-                                    * x[index];
-                            }
+                        let z = scratch.leaf_dot[i];
+                        dp[choice] += a * self.parameters[c0];
+                        dp[choice + 1] += a * self.parameters[c1] * z;
+                        dp[c0] += a * self.parameters[choice];
+                        dp[c1] += a * self.parameters[choice + 1] * z;
+                        for (j, &index) in inputs.iter().enumerate() {
+                            dp[variable + j] +=
+                                a * self.parameters[choice + 1] * self.parameters[c1] * x[index];
                         }
-                        if let Some(g) = dx.as_deref_mut() {
-                            for (j, &index) in inputs.iter().enumerate() {
-                                g[index] += a
-                                    * self.parameters[choice + 1]
-                                    * self.parameters[c1]
-                                    * self.parameters[variable + j];
-                            }
+                        for (j, &index) in inputs.iter().enumerate() {
+                            dx[index] += a
+                                * self.parameters[choice + 1]
+                                * self.parameters[c1]
+                                * self.parameters[variable + j];
                         }
                     }
                     Node::Branch {
@@ -313,18 +343,17 @@ impl Forest {
                         left,
                         right,
                     } => {
-                        adjoint[left] += a * slopes[i][0];
-                        adjoint[right] += a * slopes[i][1];
-                        if let Some(g) = dp.as_deref_mut() {
-                            for (j, op) in self.operators.iter().enumerate() {
-                                g[choice + j] += a * op.evaluate(values[left], values[right]).0;
-                            }
+                        scratch.adjoints[left] += a * scratch.slopes[i][0];
+                        scratch.adjoints[right] += a * scratch.slopes[i][1];
+                        for j in 0..self.operators.len() {
+                            dp[choice + j] +=
+                                a * scratch.operator_values[i * self.operators.len() + j];
                         }
                     }
                 }
             }
         }
-        values[tree.len() - 1]
+        scratch.values[tree.len() - 1]
     }
 
     pub fn equations(&self) -> Vec<String> {
@@ -384,6 +413,11 @@ impl Forest {
 }
 
 impl Forest {
+    fn scratch(&self, derivatives: bool) -> TreeScratch {
+        let max_nodes = self.nodes.iter().map(Vec::len).max().unwrap_or(0);
+        TreeScratch::new(max_nodes, self.operators.len(), derivatives)
+    }
+
     /// Row-major Jacobians of the vector field with respect to state and parameters.
     pub fn rhs_and_jacobians(
         &self,
@@ -398,14 +432,18 @@ impl Forest {
         assert_eq!(param_jac.len(), self.state_dim * self.parameters.len());
         state_jac.fill(0.0);
         param_jac.fill(0.0);
+        let mut scratch = self.scratch(true);
         for k in 0..self.state_dim {
             rhs[k] = self.eval_tree(
                 &self.nodes[k],
                 state,
                 &self.inputs[k],
-                Some(&mut state_jac[k * self.state_dim..(k + 1) * self.state_dim]),
-                Some(&mut param_jac[k * self.parameters.len()..(k + 1) * self.parameters.len()]),
-                1.0,
+                Some((
+                    &mut state_jac[k * self.state_dim..(k + 1) * self.state_dim],
+                    &mut param_jac[k * self.parameters.len()..(k + 1) * self.parameters.len()],
+                    1.0,
+                )),
+                &mut scratch,
             );
         }
     }
@@ -452,8 +490,9 @@ impl AdjointSystem for Forest {
     fn rhs(&self, _t: f64, state: &[f64], output: &mut [f64]) {
         assert_eq!(state.len(), self.state_dim);
         assert_eq!(output.len(), self.state_dim);
+        let mut scratch = self.scratch(false);
         for (k, tree) in self.nodes.iter().enumerate() {
-            output[k] = self.eval_tree(tree, state, &self.inputs[k], None, None, 0.0);
+            output[k] = self.eval_tree(tree, state, &self.inputs[k], None, &mut scratch);
         }
     }
     fn rhs_pullback(
@@ -468,15 +507,15 @@ impl AdjointSystem for Forest {
         assert_eq!(cotangent.len(), self.state_dim);
         assert_eq!(state_grad.len(), self.state_dim);
         assert_eq!(parameter_grad.len(), self.parameters.len());
+        let mut scratch = self.scratch(true);
         for (k, tree) in self.nodes.iter().enumerate() {
             if cotangent[k] != 0.0 {
                 self.eval_tree(
                     tree,
                     state,
                     &self.inputs[k],
-                    Some(state_grad),
-                    Some(parameter_grad),
-                    cotangent[k],
+                    Some((state_grad, parameter_grad, cotangent[k])),
+                    &mut scratch,
                 );
             }
         }

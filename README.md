@@ -9,7 +9,7 @@ Each branch mixes the registered binary operators with nonnegative weights summi
 ## Build and run
 
 ```bash
-cd SymLearning_rust
+cd Sym_rust_repo
 cargo test
 cargo run --release -- ../ADMIET/scripts/real_data/data_t.txt ../ADMIET/scripts/real_data/data_x.txt \
   --branches 1 --pretrain 30 --epochs 100 --dt 0.1 --window 1 --bounds -1 1
@@ -64,12 +64,12 @@ Run `cargo run --release --example benchmark`. It measures the median of 11 obje
 
 | Dimension | Parameters, full | Previous forward sensitivities | Reverse RK4, full | Parameters, 3 dependencies | Reverse RK4, sparse |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | 30 | 0.026 ms | 0.019 ms | 30 | 0.018 ms |
-| 4 | 76 | 0.125 ms | 0.034 ms | 68 | 0.034 ms |
-| 8 | 216 | 1.001 ms | 0.079 ms | 136 | 0.069 ms |
-| 16 | 688 | 19.110 ms | 0.214 ms | 272 | 0.129 ms |
+| 2 | 30 | 0.026 ms | 0.017 ms | 30 | 0.017 ms |
+| 4 | 76 | 0.125 ms | 0.030 ms | 68 | 0.029 ms |
+| 8 | 216 | 1.001 ms | 0.064 ms | 136 | 0.053 ms |
+| 16 | 688 | 19.110 ms | 0.160 ms | 272 | 0.097 ms |
 
-These are objective evaluation times, not time to recover the correct equations. They depend on the machine, operator registry, tree size, and integration steps.
+The 16-state reverse objective was 0.214 ms before reusing tree scratch buffers and cached leaf/operator values; it is 0.160 ms after. `cargo run --release --example profile_cost` separately times forward RHS calls, pullbacks, and weight projection. These are objective evaluation times, not time to recover the correct equations. They depend on the machine, operator registry, tree size, and integration steps.
 
 ## PDE extension
 
@@ -77,7 +77,7 @@ These are objective evaluation times, not time to recover the correct equations.
 
 ## Differences and scope
 
-- The core standard weighted-tree forest and trajectory fitting are ported. The C++ tree-file JSON format, function-fitting executables, interpolation path, and pretraining path are not yet ported.
+- The core standard weighted-tree forest and trajectory fitting are ported. The C++ tree-file JSON format, function-fitting executables, interpolation path, and pretraining file format are not yet ported.
 - RK4 replaces the C++ Euler/RK45 selection. It hits observation times exactly and rejects nonfinite dynamics. It is an explicit solver; stiff PDE discretizations will need an implicit or adaptive solver.
 - The C++ source has a separate operator setting file. The Rust CLI operator registry is in source code. Protected division is included as an optional built-in; the experimental Hill operator is not yet included.
 - Training still has a nonconvex objective. Try multiple seeds and inspect stability, loss, and learned equations before interpreting a formula.

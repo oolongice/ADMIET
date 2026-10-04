@@ -60,6 +60,25 @@ struct Step {
     stages: [Vec<f64>; 4],
 }
 
+struct ReverseScratch {
+    k1: Vec<f64>,
+    k2: Vec<f64>,
+    k3: Vec<f64>,
+    k4: Vec<f64>,
+    z: Vec<f64>,
+}
+impl ReverseScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            k1: vec![0.0; n],
+            k2: vec![0.0; n],
+            k3: vec![0.0; n],
+            k4: vec![0.0; n],
+            z: vec![0.0; n],
+        }
+    }
+}
+
 fn checked_rhs<S: AdjointSystem>(system: &S, t: f64, state: &[f64]) -> Result<Vec<f64>> {
     let mut result = vec![0.0; state.len()];
     system.rhs(t, state, &mut result);
@@ -108,47 +127,61 @@ fn reverse_step<S: AdjointSystem>(
     step: &Step,
     lambda: &mut [f64],
     gradient: &mut [f64],
+    scratch: &mut ReverseScratch,
 ) {
-    let n = lambda.len();
     let h = step.h;
-    let mut bar_k1 = lambda.iter().map(|v| h * v / 6.0).collect::<Vec<_>>();
-    let mut bar_k2 = lambda.iter().map(|v| h * v / 3.0).collect::<Vec<_>>();
-    let mut bar_k3 = bar_k2.clone();
-    let bar_k4 = bar_k1.clone();
-    let mut bar_z = vec![0.0; n];
-    system.rhs_pullback(step.t + h, &step.stages[3], &bar_k4, &mut bar_z, gradient);
-    for i in 0..n {
-        lambda[i] += bar_z[i];
-        bar_k3[i] += h * bar_z[i];
+    for (i, &value) in lambda.iter().enumerate() {
+        scratch.k1[i] = h * value / 6.0;
+        scratch.k2[i] = h * value / 3.0;
+        scratch.k3[i] = scratch.k2[i];
+        scratch.k4[i] = scratch.k1[i];
     }
-    bar_z.fill(0.0);
+    scratch.z.fill(0.0);
+    system.rhs_pullback(
+        step.t + h,
+        &step.stages[3],
+        &scratch.k4,
+        &mut scratch.z,
+        gradient,
+    );
+    for (i, value) in lambda.iter_mut().enumerate() {
+        *value += scratch.z[i];
+        scratch.k3[i] += h * scratch.z[i];
+    }
+    scratch.z.fill(0.0);
     system.rhs_pullback(
         step.t + h / 2.0,
         &step.stages[2],
-        &bar_k3,
-        &mut bar_z,
+        &scratch.k3,
+        &mut scratch.z,
         gradient,
     );
-    for i in 0..n {
-        lambda[i] += bar_z[i];
-        bar_k2[i] += h * bar_z[i] / 2.0;
+    for (i, value) in lambda.iter_mut().enumerate() {
+        *value += scratch.z[i];
+        scratch.k2[i] += h * scratch.z[i] / 2.0;
     }
-    bar_z.fill(0.0);
+    scratch.z.fill(0.0);
     system.rhs_pullback(
         step.t + h / 2.0,
         &step.stages[1],
-        &bar_k2,
-        &mut bar_z,
+        &scratch.k2,
+        &mut scratch.z,
         gradient,
     );
-    for i in 0..n {
-        lambda[i] += bar_z[i];
-        bar_k1[i] += h * bar_z[i] / 2.0;
+    for (i, value) in lambda.iter_mut().enumerate() {
+        *value += scratch.z[i];
+        scratch.k1[i] += h * scratch.z[i] / 2.0;
     }
-    bar_z.fill(0.0);
-    system.rhs_pullback(step.t, &step.stages[0], &bar_k1, &mut bar_z, gradient);
-    for i in 0..n {
-        lambda[i] += bar_z[i];
+    scratch.z.fill(0.0);
+    system.rhs_pullback(
+        step.t,
+        &step.stages[0],
+        &scratch.k1,
+        &mut scratch.z,
+        gradient,
+    );
+    for (i, value) in lambda.iter_mut().enumerate() {
+        *value += scratch.z[i];
     }
 }
 
@@ -165,6 +198,7 @@ pub fn windowed_trajectory_loss_adjoint<S: AdjointSystem>(
     }
     let n = system.state_dim();
     let mut gradient = vec![0.0; system.parameter_count()];
+    let mut reverse_scratch = ReverseScratch::new(n);
     let mut loss = 0.0;
     let scale = 1.0 / ((data.times.len() - 1) * n) as f64;
     for start in (0..data.times.len() - 1).step_by(window) {
@@ -198,7 +232,13 @@ pub fn windowed_trajectory_loss_adjoint<S: AdjointSystem>(
                 lambda[i] += 2.0 * scale * residual;
             }
             for k in (checkpoints[obs - 1]..checkpoints[obs]).rev() {
-                reverse_step(system, &steps[k], &mut lambda, &mut gradient);
+                reverse_step(
+                    system,
+                    &steps[k],
+                    &mut lambda,
+                    &mut gradient,
+                    &mut reverse_scratch,
+                );
             }
         }
     }
