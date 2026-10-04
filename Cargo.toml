@@ -1,0 +1,13 @@
+[package]
+name = "admiet"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Weighted expression tree discovery from dynamical trajectories"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "admiet"
+path = "src/main.rs"
